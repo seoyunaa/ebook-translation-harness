@@ -14,6 +14,7 @@ import shutil
 import tempfile
 import zipfile
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Iterable
 from xml.etree import ElementTree as ET
@@ -42,6 +43,61 @@ WORK_HEADING_RE = re.compile(
     re.IGNORECASE,
 )
 BOOK_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+TRANSLATION_MINIMUM_MODELS = {
+    "gpt": "gpt-5.6-terra",
+    "claude": "claude-opus-4-8",
+}
+AUTO_WORKER_FALLBACK = 4
+AUTO_WORKER_BYTES = 2 * 1024**3
+FOOTNOTE_MARKER_RE = re.compile(r"\[\^[^\]\n]+\]")
+NUMBER_PATTERN = r"[-+]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?:[eE][-+]?\d+)?"
+NUMBER_TOKEN_RE = re.compile(NUMBER_PATTERN)
+QUANTITY_TOKEN_RE = re.compile(
+    NUMBER_PATTERN
+    + r"\s*(?:"
+    r"percent|degrees?|kilometers?|centimeters?|millimeters?|meters?|miles?|"
+    r"feet|foot|inches?|pounds?|ounces?|kilograms?|grams?|liters?|"
+    r"hours?|minutes?|seconds?|km²|cm²|mm²|m²|km³|cm³|mm³|m³|"
+    r"km|cm|mm|kg|mg|lb|oz|ml|µm|μm|ha|mph|kph|Hz|kHz|MHz|GHz|"
+    r"%|‰|℃|℉|°C|°F|년|월|일|세기|쪽|페이지|장|절|권|호|명|개|건|회|차|배"
+    r")(?![A-Za-z])",
+    re.IGNORECASE,
+)
+CURRENCY_TOKEN_RE = re.compile(
+    rf"(?:[$€£¥₩]\s*{NUMBER_PATTERN}|(?:USD|EUR|GBP|JPY|KRW)\s*{NUMBER_PATTERN}|"
+    rf"{NUMBER_PATTERN}\s*(?:USD|EUR|GBP|JPY|KRW|달러|유로|원|엔))(?![A-Za-z])",
+    re.IGNORECASE,
+)
+URL_RE = re.compile(r"https?://[^\s)>\]}]+", re.IGNORECASE)
+MARKDOWN_LINK_TARGET_RE = re.compile(
+    r"!?\[[^\]\n]*\]\(\s*<?([^\s)>]+)>?(?:\s+['\"][^'\"\n]*['\"])?\s*\)"
+)
+REFERENCE_LINK_TARGET_RE = re.compile(
+    r"^\s*\[(?!\^)[^\]\n]+\]:\s*<?([^\s>]+)>?",
+    re.MULTILINE,
+)
+HTML_TARGET_RE = re.compile(
+    r"\b(href|src|id)\s*=\s*['\"]([^'\"]*)['\"]",
+    re.IGNORECASE,
+)
+INLINE_QUOTE_RE = re.compile(
+    r'“[^”\n]+”|‘[^’\n]+’|"[^"\n]+"|'
+    r"「[^」\n]+」|『[^』\n]+』|〈[^〉\n]+〉|《[^》\n]+》"
+)
+GLOSSARY_TEMPLATE = """# 책별 용어집과 문체표
+
+병렬 작업자는 배치 중 이 파일을 읽기 전용으로 사용합니다. 충돌이나 새 용어는 보고하고,
+배치 사이에 한 명의 조정자만 합의된 변경을 반영합니다.
+
+| 원어·한자 | 한국어 표기 | 첫 등장 병기 | 설명·근거 |
+|---|---|---|---|
+
+## 문체
+
+- 기본 문체:
+- 인명·지명 표기 원칙:
+- 인용·각주 처리 원칙:
+"""
 
 
 @dataclass(frozen=True)
@@ -80,6 +136,93 @@ def require_book_id(value: str) -> str:
     return value
 
 
+def _positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("value must be a positive integer") from exc
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("value must be a positive integer")
+    return parsed
+
+
+def _workers_value(value: str) -> str | int:
+    if value == "auto":
+        return value
+    return _positive_int(value)
+
+
+def _available_memory_bytes() -> int | None:
+    """Return currently available physical memory using only the standard library."""
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            class MemoryStatusEx(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            status = MemoryStatusEx()
+            status.dwLength = ctypes.sizeof(status)
+            if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+                return None
+            return int(status.ullAvailPhys)
+        except (AttributeError, OSError, ValueError):
+            return None
+    try:
+        pages = int(os.sysconf("SC_AVPHYS_PAGES"))
+        page_size = int(os.sysconf("SC_PAGE_SIZE"))
+    except (AttributeError, OSError, ValueError):
+        return None
+    available = pages * page_size
+    return available if available > 0 else None
+
+
+def _resolve_next_plan(
+    *, workers: str | int, limit: int | None, remaining: int
+) -> tuple[int, str, str]:
+    """Choose how many distinct ready tasks to list; this never starts workers."""
+    if remaining <= 0:
+        return 0, "none", "no ready tasks"
+    if limit is not None:
+        requested = limit
+        mode = "legacy-limit"
+        reason = f"explicit --limit={limit} overrides --workers"
+    elif workers != "auto":
+        requested = int(workers)
+        mode = "manual"
+        reason = f"explicit --workers={requested}"
+    else:
+        available = _available_memory_bytes()
+        mode = "auto"
+        if available is None:
+            requested = AUTO_WORKER_FALLBACK
+            reason = (
+                "available memory and platform slots unavailable; "
+                f"conservative fallback={AUTO_WORKER_FALLBACK}"
+            )
+        else:
+            memory_budget = max(1, available // AUTO_WORKER_BYTES)
+            requested = min(memory_budget, AUTO_WORKER_FALLBACK)
+            reason = (
+                f"available_memory={available / 1024**3:.2f}GiB; "
+                "2GiB/worker; unverified platform slots cap=4"
+            )
+    planned = min(requested, remaining)
+    if planned < requested:
+        reason += f"; capped_by_ready_tasks={remaining}"
+    return planned, mode, reason
+
+
 def atomic_write_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(
@@ -99,6 +242,48 @@ def _book_context(args: argparse.Namespace) -> tuple[Workspace, str, str]:
     book_key = require_book_key(args.book_key)
     book_id = require_book_id(args.book_id or (book_key[:-3] if book_key.endswith("_ko") else book_key))
     return workspace, book_key, book_id
+
+
+def _translation_policy(args: argparse.Namespace) -> dict[str, Any]:
+    minimum_model = TRANSLATION_MINIMUM_MODELS[args.translation_platform]
+    requested_model = clean_text(args.translation_model or minimum_model)
+    if not requested_model:
+        raise HarnessError("Translation model must not be empty")
+    if args.translation_platform == "gpt" and requested_model.startswith("claude-"):
+        raise HarnessError("A Claude model cannot be recorded for the GPT/Codex platform")
+    if args.translation_platform == "claude" and requested_model.startswith("gpt-"):
+        raise HarnessError("A GPT model cannot be recorded for the Claude platform")
+    minimum_status = (
+        "recorded_default"
+        if requested_model == minimum_model
+        else "custom_model_unverified"
+    )
+    return {
+        "platform": args.translation_platform,
+        "requested_model": requested_model,
+        "minimum_model": minimum_model,
+        "minimum_status": minimum_status,
+        "requested_effort": args.translation_effort,
+        "selection_surface": "external_subscription_session",
+        "runtime_verified": False,
+    }
+
+
+def _translation_policy_summary(manifest: dict[str, Any]) -> str:
+    policy = manifest.get("translation_policy")
+    if not isinstance(policy, dict):
+        return "unrecorded"
+    platform = policy.get("platform", "unknown")
+    model = policy.get("requested_model", "unknown")
+    minimum = policy.get("minimum_model", "unknown")
+    minimum_status = policy.get("minimum_status", "unknown")
+    effort = policy.get("requested_effort", "unknown")
+    surface = policy.get("selection_surface", "unknown")
+    verified = str(bool(policy.get("runtime_verified", False))).lower()
+    return (
+        f"{platform}/{model} minimum={minimum} minimum_status={minimum_status} effort={effort} "
+        f"surface={surface} runtime_verified={verified}"
+    )
 
 
 def _manifest_path(workspace: Workspace, book_id: str) -> Path:
@@ -455,6 +640,7 @@ def _prepare(
     source_outline: dict[str, Any] | None = None,
 ) -> int:
     workspace, book_key, book_id = _book_context(args)
+    translation_policy = _translation_policy(args)
     book_dir = workspace.book(book_id)
     manifest_path = _manifest_path(workspace, book_id)
     if manifest_path.exists() or (book_dir.exists() and any(book_dir.iterdir())):
@@ -510,6 +696,12 @@ def _prepare(
         "author": clean_text(args.author_ko),
         "source": str(source_path.resolve()),
         "source_type": source_type,
+        "translation_policy": translation_policy,
+        "polish_policy": {
+            "version": 1,
+            "draft_comparison_required": True,
+            "glossary": f"assets/{book_id}/glossary_ko.md",
+        },
         "task_count": len(tasks),
         "tasks": tasks,
     }
@@ -520,10 +712,14 @@ def _prepare(
     asset_dir.mkdir(parents=True, exist_ok=True)
     if not meta_path.exists():
         atomic_write_json(meta_path, meta_value)
+    glossary_path = asset_dir / "glossary_ko.md"
+    if not glossary_path.exists():
+        atomic_write_text(glossary_path, GLOSSARY_TEMPLATE)
     print(f"PASS prepared {book_key}: tasks={len(tasks)} work={book_dir}")
     if source_outline is not None:
         print(f"source_outline={book_dir / 'source_outline.json'}")
     print(f"TOC contract still requires human review: {asset_dir / 'toc_contract.json'}")
+    print(f"Glossary/style sheet: {glossary_path}")
     return 0
 
 
@@ -585,7 +781,8 @@ def command_status(args: argparse.Namespace) -> int:
     contract = config_dir / "toc_contract.json"
     print(
         f"{book_key}: draft={draft}/{total} polished={polished}/{total} "
-        f"toc_contract={'present' if contract.is_file() else 'missing'}"
+        f"toc_contract={'present' if contract.is_file() else 'missing'} "
+        f"translation_policy={_translation_policy_summary(manifest)}"
     )
     return 0
 
@@ -596,17 +793,51 @@ def command_next(args: argparse.Namespace) -> int:
         workspace, book_key=book_key, book_id=book_id
     )
     book_dir = workspace.book(book_id)
-    missing = [
-        task
-        for task in manifest["tasks"]
-        if not _translation_exists(_stage_path(book_dir, task, args.stage))
-    ][: args.limit]
-    for task in missing:
+    ready: list[dict[str, Any]] = []
+    blocked: list[dict[str, Any]] = []
+    for task in manifest["tasks"]:
+        if _translation_exists(_stage_path(book_dir, task, args.stage)):
+            continue
+        if args.stage == "polished" and not _translation_exists(
+            _stage_path(book_dir, task, "draft")
+        ):
+            blocked.append(task)
+        else:
+            ready.append(task)
+    planned, mode, reason = _resolve_next_plan(
+        workers=args.workers,
+        limit=args.limit,
+        remaining=len(ready),
+    )
+    selected = ready[:planned]
+    for task in selected:
+        source = (
+            _stage_path(book_dir, task, "draft")
+            if args.stage == "polished"
+            else book_dir / task["source"]
+        )
         print(
-            f"{task['id']}: source={book_dir / task['source']} "
+            f"{task['id']}: source={source} "
             f"target={_stage_path(book_dir, task, args.stage)}"
         )
-    print(f"next={len(missing)} stage={args.stage} book={book_key}")
+    for task in blocked:
+        if not isinstance(manifest.get("polish_policy"), dict):
+            print(
+                f"MIGRATION_REQUIRED {task['id']}: "
+                f"create_draft={_stage_path(book_dir, task, 'draft')} "
+                f"from_source={book_dir / task['source']} before_polished="
+                f"{_stage_path(book_dir, task, 'polished')}"
+            )
+        else:
+            print(
+                f"BLOCKED {task['id']}: missing_draft={_stage_path(book_dir, task, 'draft')} "
+                f"target={_stage_path(book_dir, task, 'polished')}"
+            )
+    print(
+        f"next={len(selected)} stage={args.stage} book={book_key} "
+        f"workers={planned} mode={mode} blocked_missing_draft={len(blocked)} "
+        f"reason={reason}"
+    )
     return 0
 
 
@@ -634,6 +865,186 @@ def _stage_qc(
             heading = HEADING_RE.fullmatch(line.strip())
             if heading and WORK_HEADING_RE.fullmatch(heading.group(2).strip()):
                 errors.append(f"{task['id']}:{line_number}: worker-stage heading")
+        if stage == "polished":
+            draft_path = _stage_path(book_dir, task, "draft")
+            if not _translation_exists(draft_path):
+                polish_policy = manifest.get("polish_policy")
+                requires_draft = isinstance(polish_policy, dict) and bool(
+                    polish_policy.get("draft_comparison_required", False)
+                )
+                if requires_draft:
+                    errors.append(
+                        f"{task['id']}: polished QC requires a non-empty draft file {draft_path}"
+                    )
+                continue
+            try:
+                draft_text = draft_path.read_text(encoding="utf-8")
+            except (OSError, UnicodeError) as exc:
+                errors.append(f"{task['id']}: cannot read UTF-8 draft file: {exc}")
+                continue
+            errors.extend(_polish_integrity_errors(task["id"], draft_text, text))
+    return errors
+
+
+def _stage_qc_warnings(
+    workspace: Workspace,
+    book_id: str,
+    stage: str,
+    manifest: dict[str, Any],
+) -> list[str]:
+    if stage != "polished" or isinstance(manifest.get("polish_policy"), dict):
+        return []
+    book_dir = workspace.book(book_id)
+    missing_drafts = [
+        task["id"]
+        for task in manifest["tasks"]
+        if _translation_exists(_stage_path(book_dir, task, "polished"))
+        and not _translation_exists(_stage_path(book_dir, task, "draft"))
+    ]
+    if not missing_drafts:
+        return []
+    return [
+        "legacy manifest has polished files without draft evidence; "
+        f"automatic draft-to-polished integrity comparison was unavailable for {len(missing_drafts)} task(s)"
+    ]
+
+
+def _heading_lines(text: str) -> list[str]:
+    return [
+        line.strip()
+        for line in text.splitlines()
+        if HEADING_RE.fullmatch(line.strip())
+    ]
+
+
+def _blockquote_blocks(text: str) -> list[str]:
+    """Return quote content while ignoring harmless Markdown line wrapping."""
+    blocks: list[str] = []
+    current: list[str] = []
+    for line in text.splitlines():
+        stripped = line.lstrip()
+        if stripped.startswith(">"):
+            content = stripped[1:].lstrip()
+            if content:
+                current.append(content)
+            elif current:
+                blocks.append(" ".join(current))
+                current = []
+        elif current:
+            blocks.append(" ".join(current))
+            current = []
+    if current:
+        blocks.append(" ".join(current))
+    return blocks
+
+
+def _table_cells(line: str) -> list[str] | None:
+    stripped = line.strip()
+    if "|" not in stripped:
+        return None
+    if stripped.startswith("|"):
+        stripped = stripped[1:]
+    if stripped.endswith("|") and not stripped.endswith(r"\|"):
+        stripped = stripped[:-1]
+    cells = [cell.strip() for cell in re.split(r"(?<!\\)\|", stripped)]
+    return cells if len(cells) >= 2 else None
+
+
+def _is_table_separator(cells: list[str]) -> bool:
+    return bool(cells) and all(re.fullmatch(r":?-{3,}:?", cell) for cell in cells)
+
+
+def _table_shape(text: str) -> list[tuple[int, int]]:
+    lines = text.splitlines()
+    shape: list[tuple[int, int]] = []
+    index = 1
+    while index < len(lines):
+        header = _table_cells(lines[index - 1])
+        separator = _table_cells(lines[index])
+        if (
+            header is None
+            or separator is None
+            or len(header) != len(separator)
+            or not _is_table_separator(separator)
+        ):
+            index += 1
+            continue
+        columns = len(header)
+        rows = 2
+        cursor = index + 1
+        while cursor < len(lines):
+            cells = _table_cells(lines[cursor])
+            if cells is None or len(cells) != columns:
+                break
+            rows += 1
+            cursor += 1
+        shape.append((rows, columns))
+        index = cursor
+    return shape
+
+
+def _polish_integrity_errors(task_id: str, draft: str, polished: str) -> list[str]:
+    """Check invariants that a sentence-level polish must not change."""
+    draft_clean = re.sub(r"<!--.*?-->", "", _clean_stage_text(draft), flags=re.DOTALL)
+    polished_clean = re.sub(r"<!--.*?-->", "", _clean_stage_text(polished), flags=re.DOTALL)
+    errors: list[str] = []
+
+    if _heading_lines(draft_clean) != _heading_lines(polished_clean):
+        errors.append(f"{task_id}: polished headings differ from draft headings")
+
+    protected_extractors = (
+        ("number values", lambda value: NUMBER_TOKEN_RE.findall(value)),
+        (
+            "number/unit tokens",
+            lambda value: [
+                re.sub(r"\s+", "", match.group(0)).lower()
+                for match in QUANTITY_TOKEN_RE.finditer(value)
+            ],
+        ),
+        (
+            "currency tokens",
+            lambda value: [
+                re.sub(r"\s+", "", match.group(0)).lower()
+                for match in CURRENCY_TOKEN_RE.finditer(value)
+            ],
+        ),
+        ("footnote markers", lambda value: FOOTNOTE_MARKER_RE.findall(value)),
+        ("URLs", lambda value: URL_RE.findall(value)),
+        ("Markdown link targets", lambda value: MARKDOWN_LINK_TARGET_RE.findall(value)),
+        ("reference link targets", lambda value: REFERENCE_LINK_TARGET_RE.findall(value)),
+        (
+            "HTML link/anchor targets",
+            lambda value: [
+                f"{match.group(1).lower()}={match.group(2)}"
+                for match in HTML_TARGET_RE.finditer(value)
+            ],
+        ),
+        (
+            "inline quotations",
+            lambda value: INLINE_QUOTE_RE.findall(
+                re.sub(r"<[^>\n]*>", "", value)
+            ),
+        ),
+    )
+    for label, extractor in protected_extractors:
+        draft_tokens = extractor(draft_clean)
+        polished_tokens = extractor(polished_clean)
+        if draft_tokens != polished_tokens:
+            errors.append(f"{task_id}: polished {label} differ from draft")
+
+    if _blockquote_blocks(draft_clean) != _blockquote_blocks(polished_clean):
+        errors.append(f"{task_id}: polished block quotations differ from draft")
+    if _table_shape(draft_clean) != _table_shape(polished_clean):
+        errors.append(f"{task_id}: polished table row/column shape differs from draft")
+
+    if draft_clean:
+        change_rate = 1.0 - SequenceMatcher(
+            None, draft_clean, polished_clean, autojunk=False
+        ).ratio()
+        if change_rate > 0.50:
+            errors.append(
+                f"{task_id}: polished change rate {change_rate:.1%} exceeds the 50% rollback gate"
+            )
     return errors
 
 
@@ -643,11 +1054,14 @@ def command_qc(args: argparse.Namespace) -> int:
         workspace, book_key=book_key, book_id=book_id
     )
     errors = _stage_qc(workspace, book_id, args.stage, manifest)
+    warnings = _stage_qc_warnings(workspace, book_id, args.stage, manifest)
     if errors:
         print(f"BLOCKED {book_key} {args.stage}: errors={len(errors)}")
         for error in errors:
             print(f"  - {error}")
         return 2
+    for warning in warnings:
+        print(f"WARNING {book_key} {args.stage}: {warning}")
     print(f"PASS {book_key} {args.stage}")
     return 0
 
@@ -717,6 +1131,8 @@ def command_combine(args: argparse.Namespace) -> int:
     errors = _stage_qc(workspace, book_id, args.stage, manifest)
     if errors:
         raise HarnessError("Cannot combine until stage QC passes:\n  - " + "\n  - ".join(errors))
+    for warning in _stage_qc_warnings(workspace, book_id, args.stage, manifest):
+        print(f"WARNING {book_key} {args.stage}: {warning}")
     book_dir = workspace.book(book_id)
     bodies: list[str] = []
     for task in manifest["tasks"]:
@@ -740,7 +1156,7 @@ def command_combine(args: argparse.Namespace) -> int:
     destination = workspace.combined / f"{book_key}.md"
     atomic_write_text(destination, combined_text)
     print(f"PASS combined {book_key}: {destination}")
-    if args.build:
+    if args.build or args.output_format == "epub":
         output = _build_with_configuration(
             workspace=workspace,
             book_key=book_key,
@@ -799,7 +1215,22 @@ def _add_prepare_common(parser: argparse.ArgumentParser) -> None:
     _add_identity(parser)
     parser.add_argument("--title-ko", required=True)
     parser.add_argument("--author-ko", required=True)
-    parser.add_argument("--max-chars", type=int, default=12000)
+    parser.add_argument("--max-chars", type=_positive_int, default=8000)
+    parser.add_argument(
+        "--translation-platform",
+        choices=tuple(TRANSLATION_MINIMUM_MODELS),
+        default="gpt",
+        help="External subscription session that will perform translation.",
+    )
+    parser.add_argument(
+        "--translation-model",
+        help="Requested model; defaults to the platform minimum recorded in the manifest.",
+    )
+    parser.add_argument(
+        "--translation-effort",
+        choices=("high", "xhigh", "max"),
+        default="high",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -829,7 +1260,18 @@ def build_parser() -> argparse.ArgumentParser:
     next_parser = subparsers.add_parser("next")
     _add_identity(next_parser)
     next_parser.add_argument("--stage", choices=("draft", "polished"), default="polished")
-    next_parser.add_argument("--limit", type=int, default=6)
+    next_parser.add_argument(
+        "--workers",
+        type=_workers_value,
+        default="auto",
+        metavar="auto|N",
+        help="Plan distinct next targets automatically or for N workers; does not start models.",
+    )
+    next_parser.add_argument(
+        "--limit",
+        type=_positive_int,
+        help="Legacy explicit target count; when supplied, overrides --workers.",
+    )
     next_parser.set_defaults(handler=command_next)
 
     qc = subparsers.add_parser("qc")
@@ -840,7 +1282,17 @@ def build_parser() -> argparse.ArgumentParser:
     combine = subparsers.add_parser("combine")
     _add_identity(combine)
     combine.add_argument("--stage", choices=("draft", "polished"), default="polished")
-    combine.add_argument("--build", action="store_true")
+    output = combine.add_mutually_exclusive_group()
+    output.add_argument(
+        "--build",
+        action="store_true",
+        help="Compatibility alias for --output-format epub.",
+    )
+    output.add_argument(
+        "--output-format",
+        choices=("md", "epub"),
+        help="Final deliverable format; EPUB builds retain combined Markdown as validation evidence.",
+    )
     combine.set_defaults(handler=command_combine)
 
     structure = subparsers.add_parser("structure-qc")

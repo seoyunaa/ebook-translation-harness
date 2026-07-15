@@ -1,0 +1,4 @@
+interface:
+  display_name: "Ebook Translation Harness"
+  short_description: "Translate and polish books to Korean Markdown or EPUB"
+  default_prompt: "Use $ebook-translation-harness to translate and polish this book into Korean Markdown or EPUB."

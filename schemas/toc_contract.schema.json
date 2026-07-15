@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "Reader-facing EPUB table-of-contents contract",
-  "description": "An exact, human-reviewed outline required before targeted EPUB publication.",
+  "title": "Reader-facing book table-of-contents contract",
+  "description": "An exact, human-reviewed outline required before targeted Markdown or EPUB publication.",
   "type": "object",
   "additionalProperties": false,
   "required": [
