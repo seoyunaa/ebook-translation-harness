@@ -1,0 +1,58 @@
+{
+  "version": 1,
+  "items": [
+    {
+      "label": "머리말",
+      "children": []
+    },
+    {
+      "label": "제1부: 별빛 아래의 문",
+      "children": [
+        {
+          "label": "제1장: 먼지 속의 지도",
+          "children": [
+            {
+              "label": "1.1 첫 번째 표시",
+              "children": []
+            }
+          ]
+        },
+        {
+          "label": "제2장: 종이 새의 비행",
+          "children": [
+            {
+              "label": "2.1 빈 방의 표지",
+              "children": []
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "label": "제2부: 아침의 기록",
+      "children": [
+        {
+          "label": "제3장: 되돌아온 열쇠",
+          "children": [
+            {
+              "label": "3.1 열린 서랍",
+              "children": []
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "label": "맺음말",
+      "children": []
+    }
+  ],
+  "forbidden_label_patterns": [
+    "^목차$",
+    "^[A-Z]\\.?$",
+    "\\s계속\\s+\\d+$",
+    "^[A-Z]{2,}-\\d+",
+    "AI\\s*(?:번역|윤문)",
+    "^(?:PDF\\s*)?PAGE\\s*\\d+$"
+  ]
+}

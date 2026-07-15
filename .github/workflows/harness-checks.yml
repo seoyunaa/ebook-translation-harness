@@ -1,0 +1,43 @@
+name: Harness checks
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Run regression and publication-safety tests
+        run: python -m unittest discover -s tests -p "test_*.py"
+
+      - name: Build the fictional sample
+        run: >-
+          python scripts/build_epubs_from_combined.py
+          --combined-dir examples/sample_book
+          --config-dir examples
+          --output-dir dist
+          --only sample_book_ko
+
+      - name: Validate the fictional sample
+        run: >-
+          python scripts/validate_epub_toc_contract.py
+          --config-dir examples
+          --output-dir dist
+          --combined-dir examples/sample_book
+          --only sample_book_ko

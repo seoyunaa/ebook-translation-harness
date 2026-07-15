@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Reader-facing EPUB table-of-contents contract",
+  "description": "An exact, human-reviewed outline required before targeted EPUB publication.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "items",
+    "forbidden_label_patterns"
+  ],
+  "properties": {
+    "version": {
+      "const": 1
+    },
+    "book_key": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9_-]*$"
+    },
+    "items": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/tocItem"
+      }
+    },
+    "forbidden_label_patterns": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "uniqueItems": true
+    },
+    "source_scope": {
+      "type": "object",
+      "description": "Optional evidence note about the source material actually available for translation.",
+      "additionalProperties": true
+    }
+  },
+  "$defs": {
+    "tocItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "label",
+        "children"
+      ],
+      "properties": {
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        },
+        "children": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/tocItem"
+          }
+        }
+      }
+    }
+  }
+}

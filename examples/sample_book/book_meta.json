@@ -1,0 +1,10 @@
+{
+  "book_key": "sample_book_ko",
+  "title": "별빛 도서관 산책",
+  "author": "예시 작가",
+  "cover_title": "별빛 도서관 산책",
+  "cover_author": "예시 작가",
+  "language": "ko",
+  "toc_heading_levels": [2, 3, 4],
+  "created_by": "fictional public example"
+}
